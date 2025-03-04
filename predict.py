@@ -1,6 +1,7 @@
 import os
-import time
 import subprocess
+import time
+import random
 import torch
 import numpy as np
 import cv2
@@ -9,6 +10,8 @@ import moviepy.editor as mpy
 from cog import BasePredictor, Input, Path
 
 from wan.configs import WAN_CONFIGS
+from wan.text2video_inpaint import WanT2VInpaint
+from distributed import DistributedManager
 
 MODEL_ROOT_DIR = Path("/weights")
 WEIGHTS_DIR = MODEL_ROOT_DIR / "Wan2.1-T2V-1.3B"
@@ -23,15 +26,16 @@ class Predictor(BasePredictor):
         if not WEIGHTS_DIR.exists():
             download_weights(MODEL_URL, MODEL_ROOT_DIR)
 
-        from wan.text2video_inpaint import WanT2VInpaint
+        # Define model arguments
+        model_args = {
+            'config': WAN_CONFIGS["t2v-1.3B"],
+            'checkpoint_dir': str(WEIGHTS_DIR),
+            # device_id, rank, dit_fsdp, t5_fsdp, and use_usp will be set by the manager
+        }
 
-        print("Initializing WanT2VInpaint model...")
-        self.model = WanT2VInpaint(
-            config=WAN_CONFIGS["t2v-1.3B"],
-            checkpoint_dir=str(WEIGHTS_DIR),
-            device_id=0,
-        )
-        print("Model loaded successfully")
+        # Set up distributed processing with the model class and arguments
+        self.manager = DistributedManager(WanT2VInpaint, model_args)
+        self.manager.setup()
 
     def predict(
         self,
@@ -97,25 +101,34 @@ class Predictor(BasePredictor):
 
         frame_height, frame_width = input_frames[0].shape[:2]
 
+        # Prepare parameters for the task
+        params = {
+            "input_prompt": prompt,
+            "init_video": input_pil_frames,
+            "mask": mask_pil_frames,
+            "size": (frame_width, frame_height),
+            "strength": strength,
+            "sampling_steps": sampling_steps,
+            "inpaint_fixup_steps": inpaint_fixup_steps if mask_video else 0,
+            "guide_scale": guide_scale,
+            "n_prompt": negative_prompt,
+            "seed": seed,
+            "offload_model": False,
+        }
+
+        # Submit task and get result
+        result = self.manager.submit_task(params)
+
+        # Save the result
         output_path = Path("output.mp4")
-
-        result = self.model.generate_inpaint(
-            input_prompt=prompt,
-            init_video=input_pil_frames,
-            mask=mask_pil_frames,
-            size=(frame_width, frame_height),
-            strength=strength,
-            sampling_steps=sampling_steps,
-            inpaint_fixup_steps=inpaint_fixup_steps if mask_video else 0,
-            guide_scale=guide_scale,
-            n_prompt=negative_prompt,
-            seed=seed,
-            offload_model=False,
-        )
-
         save_video_tensor(result, str(output_path), fps=frames_per_second)
 
         return output_path
+
+    def __del__(self):
+        """Clean up resources when the predictor is destroyed"""
+        if hasattr(self, 'manager'):
+            self.manager.cleanup()
 
 
 def download_weights(url: str, dest: Path):
@@ -128,7 +141,7 @@ def download_weights(url: str, dest: Path):
 
 
 def load_video_frames(
-    video_path: str, max_frames: int | None = None
+    video_path: str, max_frames: int = None
 ) -> list[np.ndarray]:
     """Load frames from a video file"""
     cap = cv2.VideoCapture(video_path)
@@ -192,7 +205,7 @@ def save_video_tensor(video_tensor, output_path, fps=30):
     print(f"Saved video to {output_path}")
 
 
-def seed_or_random_seed(seed: int | None) -> int:
+def seed_or_random_seed(seed: int = None) -> int:
     # Max seed is 2147483647
     if not seed or seed <= 0:
         seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
